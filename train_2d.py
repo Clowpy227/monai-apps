@@ -7,10 +7,8 @@ from monai.transforms import (
     LoadImaged,
     ScaleIntensityd,
     EnsureChannelFirstd,
-    RandCropByPosNegLabeld,
     RandFlipd,
     RandRotated,
-    RandScaleIntensityd,
     AsDiscrete,
     Activations
 )
@@ -20,12 +18,13 @@ from monai.metrics import DiceMetric
 from monai.losses import DiceCELoss
 from monai.inferers import sliding_window_inference
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-
+from model import PTC
+from train import loss_fn
 
 # 设定训练集图片和标签的路径，图片和标签的文件名应该相同
-images_path = "./datasets/MSD08/images_thin/"
-labels_path = "./datasets/MSD08/labels_thin_bi/"
-models_save_filename = "unet-hepatic_vessels_bi"
+images_path = "./datasets/MSD08/images_thin_2d/"
+labels_path = "./datasets/MSD08/labels_thin_bi_2d/"
+models_save_filename = "ptc2d-hepatic_vessels_bi"
 checkpoint_save_filename = "checkpoint-"+models_save_filename
 
 # 利用os模块自动获取文件夹中的文件名
@@ -34,12 +33,12 @@ if not os.path.exists(images_path):
 filename_list = os.listdir(images_path)
 
 # 设置训练集
-train_image_file_list = [images_path + filename_list[i] for i in range(40)]
-train_label_file_list = [labels_path + filename_list[i] for i in range(40)]
+train_image_file_list = [os.path.join(images_path, filename_list[i], j) for i in range(40) for j in os.listdir(images_path + filename_list[i])]
+train_label_file_list = [os.path.join(labels_path, filename_list[i], j) for i in range(40) for j in os.listdir(labels_path + filename_list[i])]
 train_dataset = [{"img": img, "seg": seg} for img, seg in zip(train_image_file_list, train_label_file_list)]
 # 设置验证集
-validate_image_file_list = [images_path + filename_list[i] for i in range(40, 50)]
-validate_label_file_list = [labels_path + filename_list[i] for i in range(40, 50)]
+validate_image_file_list = [os.path.join(images_path, filename_list[i], j) for i in range(40, 50) for j in os.listdir(images_path + filename_list[i])]
+validate_label_file_list = [os.path.join(labels_path, filename_list[i], j) for i in range(40, 50) for j in os.listdir(labels_path + filename_list[i])]
 validate_dataset = [{"img": img, "seg": seg} for img, seg in zip(validate_image_file_list, validate_label_file_list)]
 
 # 数据集载入过程
@@ -48,12 +47,12 @@ train_transform = Compose(
         LoadImaged(keys=["img", "seg"]),
         EnsureChannelFirstd(keys=["img", "seg"]),
         ScaleIntensityd(keys=["img"]),
-        RandRotated(keys=["img", "seg"], range_x=0.78, range_y=0.78, range_z=0.78),
-        RandCropByPosNegLabeld(keys=["img", "seg"], label_key="seg", spatial_size=(96, 96, 96), num_samples=4),
+        RandRotated(keys=["img", "seg"], range_x=0.78, range_y=0.78),
+        # RandCropByPosNegLabeld(keys=["img", "seg"], label_key="seg", spatial_size=(96, 96, 96), num_samples=4),
         RandFlipd(keys=["img", "seg"], spatial_axis=0),
         RandFlipd(keys=["img", "seg"], spatial_axis=1),
-        RandFlipd(keys=["img", "seg"], spatial_axis=2),
-        RandScaleIntensityd(keys=["img"], factors=1.0)
+        # RandFlipd(keys=["img", "seg"], spatial_axis=2),
+        # RandScaleIntensityd(keys=["img"], factors=1.0)
     ]
 )
 validate_transform = Compose(
@@ -69,22 +68,25 @@ train_ds = Dataset(train_dataset, transform=train_transform)
 train_loader = DataLoader(train_ds, batch_size=4, shuffle=True, num_workers=0, collate_fn=list_data_collate)
 # 载入验证集
 validate_ds = Dataset(validate_dataset, transform=validate_transform)
-validate_loader = DataLoader(validate_ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=list_data_collate)
+validate_loader = DataLoader(validate_ds, batch_size=4, shuffle=False, num_workers=0, collate_fn=list_data_collate)
 
 # 网络参数设定
 metric = DiceMetric()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 post_trans = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])        # 用于单目标分类
-model = UNet(
-    spatial_dims=3,
-    in_channels=1,
-    out_channels=1,
-    channels=(16, 32, 64, 128, 256),
-    strides=(2, 2, 2, 2),
-    num_res_units=2
-).to(device)
-loss_fn = DiceCELoss(sigmoid=True).to(device)    # 用于单目标分割
-optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+# model = UNet(
+#     spatial_dims=2,
+#     in_channels=1,
+#     out_channels=1,
+#     channels=(32, 64, 128, 256, 512),
+#     strides=(2, 2, 2, 2),
+#     num_res_units=2
+# ).to(device)
+model = PTC(1, 1).to(device)
+# loss_fn = DiceCELoss(sigmoid=True).to(device)    # 用于单目标分割
+# optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+loss_fn = DiceCELoss(sigmoid=True, lambda_dice=0).to(device)
+optimizer = torch.optim.RMSprop(model.parameters(), lr=0.0001)
 scheduler = ReduceLROnPlateau(optimizer, "min", min_lr=0.000001,patience=200, cooldown=100)
 epoch = 1
 val_interval = 5   # 实施验证间隔
@@ -128,6 +130,7 @@ while True:
         step += 1
         inputs, labels = batch_data["img"].to(device), batch_data["seg"].to(device)
         optimizer.zero_grad()
+        # print(inputs.shape, labels.shape)
         outputs = model(inputs)
         loss = loss_fn(outputs, labels)
         loss.backward()
@@ -149,8 +152,7 @@ while True:
             metric_value = 0.0
             for val_data in validate_loader:
                 val_images, val_labels = val_data["img"].to(device), val_data["seg"].to(device)
-                val_outputs = sliding_window_inference(val_images, 96, 8, model)
-                val_outputs = [post_trans(i) for i in decollate_batch(val_outputs)]
+                val_outputs = post_trans(model(val_images))
                 metric(y_pred=val_outputs, y=val_labels)
             metric_value = metric.aggregate().item()
             metric.reset()
